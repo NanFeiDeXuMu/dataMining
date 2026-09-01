@@ -1,0 +1,6 @@
+duckdb>=1.4,<2
+pandas>=2.2,<3
+pyarrow>=18,<24
+streamlit>=1.62,<2
+plotly>=6,<7
+pytest>=8,<10

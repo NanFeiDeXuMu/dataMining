@@ -8,13 +8,14 @@ from datetime import datetime, timezone
 from importlib.metadata import version
 from pathlib import Path
 import json
-import tempfile
+import secrets
 
 import duckdb
 
 from .analytics import Explorer, insights
 from .config import DEFAULT_RULES, FIELD_INFO, REQUIRED_COLUMNS, RULES, keep_expression, month_bounds
 from .download import sha256, write_json
+from .patterns import build_pattern_assets
 
 
 def literal(value) -> str:
@@ -23,6 +24,18 @@ def literal(value) -> str:
 
 def identifier(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
+
+
+def create_run_dir(base: Path) -> Path:
+    """Use inherited ACLs; tempfile.mkdtemp(mode=0700) isolates Windows users."""
+    for _ in range(100):
+        run = base / f"run-{secrets.token_hex(4)}"
+        try:
+            run.mkdir()
+            return run
+        except FileExistsError:
+            continue
+    raise FileExistsError("无法创建唯一的构建快照目录。")
 
 
 def build(month: str, root: Path) -> Path:
@@ -42,7 +55,7 @@ def build(month: str, root: Path) -> Path:
             raise ValueError(f"原始数据校验失败: {path.name}；拒绝使用被修改的快照。")
     base = root / "processed" / month
     base.mkdir(parents=True, exist_ok=True)
-    run = Path(tempfile.mkdtemp(prefix="run-", dir=base))
+    run = create_run_dir(base)
     db = run / "urbanpulse.duckdb"
     print("校验来源后开始构建；所有清洗只影响派生视图，不修改原始记录。", flush=True)
     con = duckdb.connect(str(db))
@@ -56,7 +69,7 @@ def build(month: str, root: Path) -> Path:
         if missing:
             raise ValueError(f"原始数据缺少必要字段: {sorted(missing)}")
         derived = {"record_id", "pickup_time", "dropoff_time", "pickup_zone_id", "dropoff_zone_id",
-                   "pickup_zone", "dropoff_zone", "pickup_borough", "distance_miles", "meter_fare",
+                   "pickup_zone", "dropoff_zone", "pickup_borough", "dropoff_borough", "distance_miles", "meter_fare",
                    "amount", "passengers", "duration_min", "speed_mph", "day_type"}
         if derived.intersection(names) or any(name.startswith("q_") for name in names):
             raise ValueError("输入与派生字段重名，请使用原始 TLC 行程文件。")
@@ -97,7 +110,7 @@ def build(month: str, root: Path) -> Path:
                 FROM source r
             ), enriched AS (
                 SELECT t.*, z.zone AS pickup_zone, z.borough AS pickup_borough,
-                    d.zone AS dropoff_zone,
+                    d.zone AS dropoff_zone, d.borough AS dropoff_borough,
                     NOT coalesce(z.usable, false) AS q_unknown_pickup,
                     NOT coalesce(d.usable, false) AS q_unknown_dropoff,
                     date_diff('microsecond', pickup_time, dropoff_time) / 60000000.0 AS duration_min,
@@ -152,6 +165,10 @@ def build(month: str, root: Path) -> Path:
         grid_n, trip_sum = con.execute("SELECT count(*), coalesce(sum(trip_count), 0) FROM zone_hour").fetchone()
         if trip_sum != clean_n:
             raise AssertionError("区域-小时汇总与清洗后总数不守恒。")
+        print("区域-小时特征完成；正在挖掘 Apriori 与 FP-Growth 频繁模式。", flush=True)
+        pattern_report = build_pattern_assets(con, run, names)
+        if pattern_report["transaction_count"] != clean_n:
+            raise AssertionError("行程事务数与清洗后总数不守恒。")
         con.execute("DROP VIEW source")
         con.execute("CHECKPOINT")
     finally:
@@ -165,7 +182,7 @@ def build(month: str, root: Path) -> Path:
         "month": month, "built_at_utc": datetime.now(timezone.utc).isoformat(),
         "source": manifest, "policy": list(DEFAULT_RULES),
         "rules": [{"key": r.key, "label": r.label, "reason": r.reason, "default": r.default} for r in RULES],
-        "raw": raw, "clean": clean, "zone_hour_rows": grid_n,
+        "raw": raw, "clean": clean, "zone_hour_rows": grid_n, "patterns": pattern_report,
         "quality": quality.to_dict(orient="records"), "schema": profile, "insights": observations,
         "versions": {package: version(package) for package in ("duckdb", "pandas", "pyarrow")},
         "limitations": [
@@ -176,19 +193,25 @@ def build(month: str, root: Path) -> Path:
             "小时网格 0 表示该文件中未观测到保留记录，不是确认区域无出行或数据源完整。",
             "不含现金小费，不能据此比较不同支付方式的全部小费。",
             "全文件保留率和筛选窗口保留率可能不同，问题规则之间允许重叠。",
+            "关联规则描述共同出现，不证明因果关系；结果依赖默认清洗与固定分箱。",
         ],
     }
     write_json(run / "report.json", metadata)
+    write_json(run / "pattern_report.json", pattern_report)
     report = [f"# UrbanPulse 数据体检报告 | {month}", "", "## 三条可复核观察", ""]
     report.extend(f"- {line}" for line in observations)
     report.extend(["", "## 质量检查（规则重叠，不可相加）", "", "| 检查项 | 记录数 | 占全文件比例 | 默认排除 |", "|---|---:|---:|---|"])
     for row in metadata["quality"]:
         report.append(f"| {row['检查项']} | {row['记录数']:,} | {row['占原始窗口比例']:.2%} | {'是' if row['默认排除'] else '否'} |")
     report.extend(["", "## 解释边界", ""] + [f"- {x}" for x in metadata["limitations"]])
-    report.extend(["", "## 可复现信息", "", f"- 默认清洗规则：`{', '.join(DEFAULT_RULES)}`", f"- 区域-小时特征行数：{grid_n:,}", "- 原始文件未修改；全部原始字段、稳定记录号和检查标记存于数据库 annotated 表。"])
+    report.extend(["", "## 关联规则", "",
+                   f"- 事务：{pattern_report['transaction_count']:,}；聚合篮子：{pattern_report['unique_baskets']:,}",
+                   f"- 频繁项集：{pattern_report['frequent_itemsets']:,}；规则：{pattern_report['rules']:,}",
+                   "- Apriori 与 FP-Growth 已验证得到完全相同的频繁项集；关联不代表因果。",
+                   "", "## 可复现信息", "", f"- 默认清洗规则：`{', '.join(DEFAULT_RULES)}`", f"- 区域-小时特征行数：{grid_n:,}", "- 原始文件未修改；全部原始字段、稳定记录号和检查标记存于数据库 annotated 表。"])
     for entry in manifest["files"]:
         report.append(f"- {entry['file']}：SHA-256 `{entry['sha256']}`；来源 {entry.get('url', '本地测试夹具')}")
     (run / "report.md").write_text("\n".join(report) + "\n", encoding="utf-8")
     write_json(base / "active.json", {"run": run.name})
-    print(f"构建完成：原始 {count:,}；默认规则保留 {clean_n:,}；特征 {grid_n:,} 行。\n输出：{run}", flush=True)
+    print(f"构建完成：原始 {count:,}；默认规则保留 {clean_n:,}；特征 {grid_n:,} 行；关联规则 {pattern_report['rules']:,} 条。\n输出：{run}", flush=True)
     return run

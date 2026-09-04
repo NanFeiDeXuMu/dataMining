@@ -1,4 +1,4 @@
-"""UrbanPulse lesson 1: explore evidence before reaching for a model.
+"""UrbanPulse v0.2: data quality, exploration and association patterns.
 
 Run: python -m streamlit run app.py
 """
@@ -67,9 +67,21 @@ def example_rows(run_dir, month, keys, start, end, zone, issue):
         return ex.sample(keys, start, end, zone, issue)
 
 
-st.markdown('<div class="eyebrow">URBANPULSE / DATA LAB 01</div>', unsafe_allow_html=True)
+@st.cache_data(max_entries=32, show_spinner=False)
+def pattern_rows(run_dir, month, support, confidence, lift, day_item, pickup_item):
+    with Explorer(Path(run_dir) / "urbanpulse.duckdb", month) as ex:
+        return ex.pattern_rules(support, confidence, lift, (day_item, pickup_item))
+
+
+@st.cache_data(max_entries=32, show_spinner=False)
+def pattern_examples(run_dir, month, antecedent, consequent):
+    with Explorer(Path(run_dir) / "urbanpulse.duckdb", month) as ex:
+        return ex.pattern_sample(antecedent, consequent)
+
+
+st.markdown('<div class="eyebrow">URBANPULSE / DATA LAB 02</div>', unsafe_allow_html=True)
 st.title("城市出行数据实验室")
-st.caption("先理解数据，再相信结论。第一课：数据理解 → 质量检查 → 描述统计 → 证据展示")
+st.caption("先理解数据，再发现模式。数据质量 → 描述统计 → 频繁项集 → 关联规则 → 证据核查")
 
 root = data_root()
 months = available_months(root)
@@ -121,7 +133,7 @@ with st.sidebar:
     field = st.selectbox("分布查看字段", ["amount", "distance_miles", "duration_min"],
                          format_func=lambda x: {"amount": "总额（USD）", "distance_miles": "距离（英里）", "duration_min": "时长（分钟）"}[x], key="field")
     st.divider()
-    st.caption("v0.1 · 本地分析 · 无模型 / 无 LLM")
+    st.caption("v0.2 · 本地分析 · 关联规则 / 无 LLM")
     st.markdown(f"[数据来源]({SOURCE_PAGE}) · [官方字段字典]({DICTIONARY_URL})")
 
 with st.spinner("正在查询完整数据快照…"):
@@ -137,7 +149,8 @@ cols[2].metric("总额中位数 · USD", money(current["median_amount"]), help="
 cols[3].metric("所选规则保留率", f"{clean['records']/raw['records']:.2%}" if raw["records"] else "—",
                help="处理后记录数 / 同一窗口原始记录数；不代表数据正确率。")
 
-overview, quality_tab, dictionary_tab, lesson_tab = st.tabs(["数据概览", "质量体检", "字段字典", "学习与复现"])
+overview, quality_tab, dictionary_tab, lesson_tab, pattern_tab = st.tabs(
+    ["数据概览", "质量体检", "字段字典", "学习与复现", "模式发现"])
 
 with overview:
     if not current["records"]:
@@ -213,7 +226,68 @@ with lesson_tab:
     st.code(f"python -m urbanpulse prepare --month {month}\npython -m streamlit run app.py\npython -m pytest -q", language="shell")
     st.caption("清洗后的完整行程与区域-小时特征由批处理生成。页面规则是临时探索，不覆盖磁盘上的默认规则产物。")
     st.code(str(run), language=None)
-    st.markdown("输出包含 `urbanpulse.duckdb`、`cleaned_trips.parquet`、`zone_hour.parquet`、`report.json` 和 `report.md`。")
+    st.markdown("输出包含清洗数据、区域小时特征、事务表、频繁项集、关联规则和可复核报告。")
+
+with pattern_tab:
+    st.subheader("哪些出行属性经常共同出现？")
+    pattern_meta = metadata.get("patterns")
+    if not pattern_meta:
+        st.warning(f"当前是 v0.1 快照。请运行 `python -m urbanpulse build --month {month}` 生成模式结果。")
+    else:
+        cfg = pattern_meta["config"]
+        st.caption("模式预计算于整月默认清洗结果，不随侧栏日期、区域或临时清洗规则变化。每条行程表示为 8 个类别项；关联不代表因果。")
+        summary = st.columns(4)
+        summary[0].metric("行程事务", f"{pattern_meta['transaction_count']:,}")
+        summary[1].metric("不同事务篮子", f"{pattern_meta['unique_baskets']:,}")
+        summary[2].metric("频繁项集", f"{pattern_meta['frequent_itemsets']:,}")
+        summary[3].metric("候选规则", f"{pattern_meta['rules']:,}")
+        filters = st.columns(3)
+        min_support = filters[0].slider("最小支持度", float(cfg["min_support"]), 0.20,
+                                        float(cfg["min_support"]), 0.01, format="%.2f", key="pattern_support")
+        min_confidence = filters[1].slider("最小置信度", float(cfg["min_confidence"]), 1.0,
+                                           float(cfg["min_confidence"]), 0.05, format="%.2f", key="pattern_confidence")
+        min_lift = filters[2].slider("最小提升度", float(cfg["min_lift"]), 3.0,
+                                     float(cfg["min_lift"]), 0.05, format="%.2f", key="pattern_lift")
+        required = st.columns(2)
+        day_item = required[0].selectbox("规则必须包含日期类型", [None, "日期=工作日", "日期=周末"],
+                                         format_func=lambda value: "不限" if value is None else value.split("=", 1)[1],
+                                         key="pattern_day")
+        borough_items = [f"上车行政区={name}" for name in sorted(
+            set(zones["borough"].dropna()) - {"Unknown", "N/A"})]
+        pickup_item = required[1].selectbox("规则必须包含上车行政区", [None] + borough_items,
+                                            format_func=lambda value: "不限" if value is None else value.split("=", 1)[1],
+                                            key="pattern_pickup")
+        rules_frame = pattern_rows(str(run), month, min_support, min_confidence, min_lift,
+                                   day_item, pickup_item)
+        if rules_frame.empty:
+            st.info("当前阈值下没有规则，请降低筛选阈值。页面最低支持度不能低于快照构建阈值。")
+        else:
+            plot = rules_frame.head(100).copy()
+            chart(px.scatter(plot, x="support", y="confidence", size="support_count", color="lift",
+                             hover_data=["antecedent", "consequent"],
+                             labels={"support": "支持度", "confidence": "置信度", "lift": "提升度",
+                                     "support_count": "共同出现记录数", "antecedent": "前件", "consequent": "后件"}), 360)
+            display = rules_frame.rename(columns={"antecedent": "前件", "consequent": "后件",
+                                                   "support_count": "共同记录数", "support": "支持度",
+                                                   "confidence": "置信度", "lift": "提升度"})
+            st.dataframe(display, hide_index=True, width="stretch",
+                         column_config={name: st.column_config.NumberColumn(format="percent")
+                                        for name in ("支持度", "置信度")})
+            rule_options = list(rules_frame[["antecedent", "consequent"]].itertuples(index=False, name=None))
+            selected = st.selectbox("选择一条规则查看匹配行程", rule_options,
+                                    format_func=lambda rule: f"{rule[0]} → {rule[1]}", key="pattern_rule")
+            chosen = rules_frame[(rules_frame.antecedent == selected[0]) &
+                                 (rules_frame.consequent == selected[1])].iloc[0]
+            evidence = pattern_examples(str(run), month, chosen.antecedent, chosen.consequent)
+            st.caption(f"最多展示 100 条共同包含前件和后件的行程；规则基于 {chosen.support_count:,} 条记录。")
+            st.dataframe(evidence, hide_index=True, width="stretch")
+        with st.expander("算法与口径"):
+            algorithms = pattern_meta["algorithms"]
+            st.write(f"Apriori 与 FP-Growth 频繁项集一致：{'是' if algorithms['identical'] else '否'}。最大项集长度：{cfg['max_itemset_size']}。")
+            st.write(f"本次构建用时：Apriori {algorithms['apriori_seconds']:.3f} 秒，FP-Growth {algorithms['fpgrowth_seconds']:.3f} 秒；单次用时仅作实现观察，不是严格基准测试。")
+            st.write("事务字段：" + "、".join(pattern_meta["fields"]))
+            for limitation in pattern_meta["limitations"]:
+                st.markdown(f"- {limitation}")
 
 report_payload = {"month": month, "view": view, "rules": list(keys),
                   "start_date": str(start) if start else None, "end_date": str(end) if end else None,
@@ -223,4 +297,4 @@ report_payload = {"month": month, "view": view, "rules": list(keys),
 st.divider()
 st.download_button("导出当前窗口分析报告 JSON", json.dumps(report_payload, ensure_ascii=False, indent=2, allow_nan=False),
                    file_name=f"urbanpulse_{month}_analysis.json", mime="application/json")
-st.caption("UrbanPulse v0.1 · 学习重点是可信的数据处理，不是把每个异常都删除。")
+st.caption("UrbanPulse v0.2 · 可信预处理是模式挖掘的前提，关联规则不是因果证明。")

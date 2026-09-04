@@ -10,7 +10,7 @@ UrbanPulse 是一个城市出行模式、需求预测与异常检测平台。项
 
 项目采用“边学边做”的方式持续迭代，学期末交付可交互、可解释、可复现的完整 Demo。
 
-当前落地：v0.1「第一课数据实验室」，包含质量体检、清洗对比、描述统计和可复现数据管道。运行方式见 [README.md](README.md)，练习见 [docs/LESSON1.md](docs/LESSON1.md)。
+当前落地：v0.2「关联模式实验室」。v0.1 提供质量体检、清洗对比、描述统计和可复现数据管道；v0.2 新增事务特征、Apriori/FP-Growth、关联规则评价与证据回溯。运行方式见 [README.md](README.md)，练习见 [docs/LESSON1.md](docs/LESSON1.md) 和 [docs/LESSON2.md](docs/LESSON2.md)。
 
 ## 2. 数据范围
 

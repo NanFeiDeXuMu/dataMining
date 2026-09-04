@@ -51,6 +51,25 @@ def test_distribution_and_inspection(monkeypatch, dataset):
     assert len(app.dataframe[1].value) == 1
 
 
+def test_pattern_filters_and_evidence(monkeypatch, dataset):
+    app = create_app(monkeypatch, dataset)
+    assert app.metric[4].value == "11"
+    assert app.metric[6].value
+    rules = app.dataframe[3].value
+    assert not rules.empty and (rules["支持度"] >= 0.01).all()
+    assert app.selectbox(key="pattern_rule").value
+    assert not app.dataframe[4].value.empty
+    app.selectbox(key="pattern_day").set_value("日期=工作日").run()
+    assert not app.exception
+    filtered_rules = app.dataframe[3].value
+    combined_items = filtered_rules["前件"] + "；" + filtered_rules["后件"]
+    assert combined_items.str.contains("日期=工作日", regex=False).all()
+    app.slider(key="pattern_support").set_value(0.2).run()
+    assert not app.exception
+    if len(app.dataframe) > 3:
+        assert (app.dataframe[3].value["支持度"] >= 0.2).all()
+
+
 def test_no_data_has_setup_instructions(monkeypatch, tmp_path):
     monkeypatch.setenv("URBANPULSE_DATA_DIR", str(tmp_path))
     app = AppTest.from_file(str(ROOT / "app.py")).run()

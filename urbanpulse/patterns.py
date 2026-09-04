@@ -1,0 +1,254 @@
+"""Weighted Apriori and FP-Growth for interpretable trip-pattern mining."""
+
+from collections import Counter, defaultdict
+from dataclasses import asdict
+from itertools import combinations
+from math import ceil
+from pathlib import Path
+from time import perf_counter
+
+import pandas as pd
+
+from .config import PATTERN_CONFIG, PATTERN_FIELDS, PatternConfig
+
+
+def _transactions(baskets):
+    normalized = []
+    for items, weight in baskets:
+        transaction = tuple(sorted(set(items)))
+        weight = int(weight)
+        if transaction and weight > 0:
+            normalized.append((transaction, weight))
+    return normalized
+
+
+def _minimum_count(total: int, support: float) -> int:
+    if not 0 < support <= 1:
+        raise ValueError("最小支持度必须在 (0, 1]。")
+    return max(1, ceil(total * support)) if total else 0
+
+
+def apriori(baskets, min_support=0.01, max_size=3):
+    """Return every frequent itemset and its weighted support count."""
+    transactions = _transactions(baskets)
+    total = sum(weight for _, weight in transactions)
+    min_count = _minimum_count(total, min_support)
+    if not total or max_size < 1:
+        return {}
+    singles = Counter()
+    for items, weight in transactions:
+        singles.update({item: weight for item in items})
+    level = {frozenset((item,)) for item, count in singles.items() if count >= min_count}
+    result = {itemset: singles[next(iter(itemset))] for itemset in level}
+    for size in range(2, max_size + 1):
+        universe = sorted({item for itemset in level for item in itemset})
+        candidates = {
+            frozenset(parts) for parts in combinations(universe, size)
+            if all(frozenset(subset) in level for subset in combinations(parts, size - 1))
+        }
+        if not candidates:
+            break
+        counts = Counter()
+        for items, weight in transactions:
+            for parts in combinations(items, size):
+                candidate = frozenset(parts)
+                if candidate in candidates:
+                    counts[candidate] += weight
+        level = {candidate for candidate, count in counts.items() if count >= min_count}
+        result.update({candidate: counts[candidate] for candidate in level})
+        if not level:
+            break
+    return result
+
+
+class _FPNode:
+    __slots__ = ("item", "count", "parent", "children")
+
+    def __init__(self, item, count=0, parent=None):
+        self.item = item
+        self.count = count
+        self.parent = parent
+        self.children = {}
+
+
+def _fp_tree(transactions, min_count):
+    supports = Counter()
+    for items, weight in transactions:
+        supports.update({item: weight for item in items})
+    supports = Counter({item: count for item, count in supports.items() if count >= min_count})
+    if not supports:
+        return None, {}, supports
+    order = {item: rank for rank, item in enumerate(sorted(supports, key=lambda x: (-supports[x], x)))}
+    root = _FPNode(None)
+    headers = defaultdict(list)
+    for items, weight in transactions:
+        current = root
+        for item in sorted((item for item in items if item in supports), key=lambda x: order[x]):
+            if item not in current.children:
+                current.children[item] = _FPNode(item, 0, current)
+                headers[item].append(current.children[item])
+            current = current.children[item]
+            current.count += weight
+    return root, headers, supports
+
+
+def fp_growth(baskets, min_support=0.01, max_size=3):
+    """Mine weighted transactions with an FP-tree and conditional pattern bases."""
+    transactions = _transactions(baskets)
+    total = sum(weight for _, weight in transactions)
+    min_count = _minimum_count(total, min_support)
+    if not total or max_size < 1:
+        return {}
+    result = {}
+
+    def visit(conditional, prefix):
+        _, headers, supports = _fp_tree(conditional, min_count)
+        for item in sorted(supports, key=lambda x: (supports[x], x)):
+            itemset = frozenset((*prefix, item))
+            result[itemset] = supports[item]
+            if len(itemset) >= max_size:
+                continue
+            paths = []
+            for node in headers[item]:
+                path, parent = [], node.parent
+                while parent is not None and parent.item is not None:
+                    path.append(parent.item)
+                    parent = parent.parent
+                if path:
+                    paths.append((tuple(path), node.count))
+            if paths:
+                visit(paths, itemset)
+
+    visit(transactions, frozenset())
+    return result
+
+
+def frequent_frame(itemsets, total):
+    columns = ["itemset", "size", "support_count", "support"]
+    rows = [{
+        "itemset": "；".join(sorted(itemset)), "size": len(itemset),
+        "support_count": int(count), "support": count / total,
+    } for itemset, count in itemsets.items()]
+    rows.sort(key=lambda row: (row["size"], -row["support_count"], row["itemset"]))
+    return pd.DataFrame(rows, columns=columns)
+
+
+def association_rules(itemsets, total, min_confidence=0.35, min_lift=1.05):
+    if not 0 <= min_confidence <= 1 or min_lift < 0:
+        raise ValueError("置信度必须在 [0, 1]，提升度不能为负。")
+    columns = ["antecedent", "consequent", "antecedent_size", "consequent_size",
+               "support_count", "antecedent_count", "consequent_count",
+               "support", "confidence", "lift"]
+    if not total:
+        return pd.DataFrame(columns=columns)
+    rows = []
+    for itemset, joint_count in itemsets.items():
+        if len(itemset) < 2:
+            continue
+        ordered = sorted(itemset)
+        for size in range(1, len(ordered)):
+            for left in combinations(ordered, size):
+                antecedent = frozenset(left)
+                consequent = itemset - antecedent
+                left_count = itemsets[antecedent]
+                right_count = itemsets[consequent]
+                confidence = joint_count / left_count
+                lift = confidence / (right_count / total)
+                if confidence >= min_confidence and lift >= min_lift:
+                    rows.append({
+                        "antecedent": "；".join(sorted(antecedent)),
+                        "consequent": "；".join(sorted(consequent)),
+                        "antecedent_size": len(antecedent), "consequent_size": len(consequent),
+                        "support_count": int(joint_count), "antecedent_count": int(left_count),
+                        "consequent_count": int(right_count), "support": joint_count / total,
+                        "confidence": confidence, "lift": lift,
+                    })
+    rows.sort(key=lambda row: (-row["lift"], -row["confidence"], -row["support"],
+                               row["antecedent"], row["consequent"]))
+    return pd.DataFrame(rows, columns=columns)
+
+
+def build_pattern_assets(con, run: Path, source_columns, config: PatternConfig = PATTERN_CONFIG):
+    """Create transactions, mine both algorithms, verify equality and persist evidence."""
+    payment = """CASE TRY_CAST(payment_type AS INTEGER)
+        WHEN 1 THEN '支付=信用卡' WHEN 2 THEN '支付=现金' WHEN 3 THEN '支付=免付'
+        WHEN 4 THEN '支付=争议' WHEN 5 THEN '支付=未知' WHEN 6 THEN '支付=作废'
+        ELSE '支付=其他/缺失' END""" if "payment_type" in source_columns else "'支付=字段缺失'"
+    con.execute(f"""
+        CREATE TABLE trip_transactions AS
+        WITH bucketed AS (
+            SELECT record_id,
+                concat('日期=', day_type) AS day_item,
+                CASE WHEN hour(pickup_time) < 6 THEN '时段=凌晨(00-05)'
+                    WHEN hour(pickup_time) < 10 THEN '时段=早高峰(06-09)'
+                    WHEN hour(pickup_time) < 16 THEN '时段=白天(10-15)'
+                    WHEN hour(pickup_time) < 20 THEN '时段=晚高峰(16-19)'
+                    ELSE '时段=夜间(20-23)' END AS time_item,
+                concat('上车行政区=', pickup_borough) AS pickup_item,
+                concat('下车行政区=', dropoff_borough) AS dropoff_item,
+                CASE WHEN distance_miles = 0 THEN '距离=零'
+                    WHEN distance_miles < 2 THEN '距离=短途(<2mi)'
+                    WHEN distance_miles < 5 THEN '距离=中途(2-5mi)'
+                    WHEN distance_miles < 15 THEN '距离=长途(5-15mi)'
+                    ELSE '距离=超长途(>=15mi)' END AS distance_item,
+                CASE WHEN amount < 0 THEN '费用=负值'
+                    WHEN amount < 15 THEN '费用=低(<$15)'
+                    WHEN amount < 30 THEN '费用=中($15-30)'
+                    WHEN amount < 75 THEN '费用=高($30-75)'
+                    ELSE '费用=极高(>=$75)' END AS amount_item,
+                {payment} AS payment_item,
+                CASE WHEN passengers IS NULL OR NOT isfinite(passengers) THEN '乘客=缺失'
+                    WHEN passengers <= 0 THEN '乘客=零'
+                    WHEN passengers = 1 THEN '乘客=1'
+                    WHEN passengers = 2 THEN '乘客=2'
+                    ELSE '乘客=3+' END AS passenger_item
+            FROM cleaned
+        )
+        SELECT *, [day_item, time_item, pickup_item, dropoff_item, distance_item,
+            amount_item, payment_item, passenger_item] AS items
+        FROM bucketed
+    """)
+    con.execute("CREATE TABLE transaction_baskets AS SELECT items, count(*)::BIGINT AS transaction_count FROM trip_transactions GROUP BY items")
+    transaction_count = con.execute("SELECT count(*) FROM trip_transactions").fetchone()[0]
+    baskets = [(items, count) for items, count in con.execute(
+        "SELECT items, transaction_count FROM transaction_baskets ORDER BY items").fetchall()]
+    if sum(weight for _, weight in baskets) != transaction_count:
+        raise AssertionError("聚合事务篮子的权重与行程事务数不守恒。")
+
+    started = perf_counter()
+    apriori_sets = apriori(baskets, config.min_support, config.max_itemset_size)
+    apriori_seconds = perf_counter() - started
+    started = perf_counter()
+    fp_sets = fp_growth(baskets, config.min_support, config.max_itemset_size)
+    fp_seconds = perf_counter() - started
+    if apriori_sets != fp_sets:
+        raise AssertionError("Apriori 与 FP-Growth 的频繁项集不一致。")
+
+    frequent = frequent_frame(apriori_sets, transaction_count)
+    rules = association_rules(apriori_sets, transaction_count, config.min_confidence, config.min_lift)
+    con.register("_frequent_frame", frequent)
+    con.register("_rule_frame", rules)
+    con.execute("CREATE TABLE frequent_itemsets AS SELECT * FROM _frequent_frame")
+    con.execute("CREATE TABLE association_rules AS SELECT * FROM _rule_frame")
+    con.unregister("_frequent_frame")
+    con.unregister("_rule_frame")
+    con.execute(f"COPY trip_transactions TO '{str(run / 'trip_transactions.parquet').replace("'", "''")}' (FORMAT PARQUET, COMPRESSION ZSTD)")
+    con.execute(f"COPY frequent_itemsets TO '{str(run / 'frequent_itemsets.parquet').replace("'", "''")}' (FORMAT PARQUET, COMPRESSION ZSTD)")
+    con.execute(f"COPY association_rules TO '{str(run / 'association_rules.parquet').replace("'", "''")}' (FORMAT PARQUET, COMPRESSION ZSTD)")
+
+    return {
+        "transaction_count": int(transaction_count), "unique_baskets": len(baskets),
+        "items_per_transaction": len(PATTERN_FIELDS), "fields": list(PATTERN_FIELDS),
+        "config": asdict(config), "frequent_itemsets": len(frequent), "rules": len(rules),
+        "algorithms": {
+            "apriori_itemsets": len(apriori_sets), "fpgrowth_itemsets": len(fp_sets),
+            "identical": True, "apriori_seconds": round(apriori_seconds, 6),
+            "fpgrowth_seconds": round(fp_seconds, 6),
+        },
+        "top_rules": rules.head(10).to_dict(orient="records"),
+        "limitations": [
+            "规则描述共同出现关系，不证明因果关系或未来必然发生。",
+            "模式基于默认清洗策略和固定分箱；改变口径可能改变结果。",
+            "最低支持度以下的项集未保存，页面不能恢复未挖掘的低频规则。",
+        ],
+    }

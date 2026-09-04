@@ -7,7 +7,7 @@ import json
 import duckdb
 import pandas as pd
 
-from .config import RULES, keep_expression, month_bounds
+from .config import PATTERN_CONFIG, RULES, keep_expression, month_bounds
 
 
 def active_run(root: Path, month: str) -> Path:
@@ -161,6 +161,43 @@ class Explorer:
             FROM annotated WHERE {scope} AND {keep_expression(rules)} AND {issue_filter}
             ORDER BY record_id LIMIT ?
         """, values + [int(limit)])
+
+    def pattern_rules(self, min_support=None, min_confidence=None, min_lift=None,
+                      required_items=(), limit=200):
+        min_support = PATTERN_CONFIG.min_support if min_support is None else float(min_support)
+        min_confidence = PATTERN_CONFIG.min_confidence if min_confidence is None else float(min_confidence)
+        min_lift = PATTERN_CONFIG.min_lift if min_lift is None else float(min_lift)
+        limit = int(limit)
+        if not PATTERN_CONFIG.min_support <= min_support <= 1:
+            raise ValueError(f"支持度不能低于快照挖掘阈值 {PATTERN_CONFIG.min_support:.2%}。")
+        required_items = tuple(item for item in required_items if item)
+        if (not 0 <= min_confidence <= 1 or min_lift < 0 or not 1 <= limit <= 1000
+                or len(required_items) > 8):
+            raise ValueError("关联规则筛选参数无效。")
+        required = "".join(
+            " AND list_contains(str_split(concat_ws('；', antecedent, consequent), '；'), ?)"
+            for _ in required_items)
+        return self.query(f"""
+            SELECT antecedent, consequent, support_count, support, confidence, lift
+            FROM association_rules
+            WHERE support >= ? AND confidence >= ? AND lift >= ? {required}
+            ORDER BY lift DESC, confidence DESC, support DESC, antecedent, consequent
+            LIMIT ?
+        """, [min_support, min_confidence, min_lift, *required_items, limit])
+
+    def pattern_sample(self, antecedent: str, consequent: str, limit=100):
+        items = [item for side in (antecedent, consequent) for item in side.split("；") if item]
+        limit = int(limit)
+        if not items or len(items) > PATTERN_CONFIG.max_itemset_size or not 1 <= limit <= 100:
+            raise ValueError("关联规则示例参数无效。")
+        conditions = " AND ".join("list_contains(t.items, ?)" for _ in items)
+        return self.query(f"""
+            SELECT a.record_id, a.pickup_time, a.pickup_zone, a.dropoff_zone,
+                a.distance_miles, a.amount, t.items
+            FROM trip_transactions t JOIN annotated a USING (record_id)
+            WHERE {conditions}
+            ORDER BY a.record_id LIMIT ?
+        """, items + [limit])
 
 
 def insights(raw: dict, clean: dict, hourly: pd.DataFrame, month: str) -> list[str]:

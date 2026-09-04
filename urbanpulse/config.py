@@ -36,6 +36,16 @@ class Rule:
     default: bool = False
 
 
+@dataclass(frozen=True)
+class PatternConfig:
+    """Fixed mining policy recorded with every snapshot."""
+
+    min_support: float = 0.01
+    min_confidence: float = 0.35
+    min_lift: float = 1.05
+    max_itemset_size: int = 3
+
+
 RULES = (
     Rule("missing_time", "时间缺失/无法解析", "无法计算行程时长或定位到小时。", True),
     Rule("invalid_duration", "时长不大于 0", "下车时间不晚于上车时间。", True),
@@ -53,6 +63,11 @@ RULES = (
 )
 RULE_BY_KEY = {rule.key: rule for rule in RULES}
 DEFAULT_RULES = tuple(rule.key for rule in RULES if rule.default)
+PATTERN_CONFIG = PatternConfig()
+PATTERN_FIELDS = (
+    "日期类型", "上车时段", "上车行政区", "下车行政区",
+    "距离区间", "费用区间", "支付方式", "乘客数区间",
+)
 REQUIRED_COLUMNS = (
     "tpep_pickup_datetime", "tpep_dropoff_datetime", "trip_distance",
     "PULocationID", "DOLocationID", "fare_amount", "total_amount",

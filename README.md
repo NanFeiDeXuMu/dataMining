@@ -1,8 +1,8 @@
-# UrbanPulse · 第一课数据实验室
+# UrbanPulse · 数据与关联模式实验室
 
 城市出行数据体检与探索台：从真实原始数据得到可复核的观察，为学期项目提供数据基础。
 
-本版本只做数据理解、质量检查与描述统计，不训练模型，不接 LLM，不发布到外部网站。
+v0.2 在数据理解、质量检查与描述统计上新增事务特征、Apriori、FP-Growth 和关联规则；不训练预测模型，不接 LLM，不发布到外部网站。
 
 ## 快速运行
 
@@ -33,6 +33,9 @@ py -3.12 -m venv .venv
 - 查看 13 项质量标记及原始记录示例，理解规则重叠。
 - 查看字段类型、单位、缺失比例和文件 SHA-256。
 - 导出当前筛选窗口分析报告、最多 100 条排查示例。
+- 使用 8 个类别维度表示行程事务，查看频繁项集和关联规则。
+- 调整支持度、置信度和提升度阈值，并回溯规则对应的原始行程。
+- 比较 Apriori 与 FP-Growth；结果不一致时拒绝激活快照。
 
 使用全月数据计算指标，不用演示假数。排查示例不是随机样本；直方图明确报告显示范围外的记录数。
 
@@ -65,6 +68,10 @@ data/processed/<月份>/
     urbanpulse.duckdb              全量原始字段、派生字段、逐条质量标记
     cleaned_trips.parquet          默认规则保留的行程，含稳定 record_id
     zone_hour.parquet              区域 × 小时网格，后续模型输入
+    trip_transactions.parquet       每条默认清洗行程的 8 项事务表示
+    frequent_itemsets.parquet       Apriori 与 FP-Growth 一致的频繁项集
+    association_rules.parquet       带分子、分母和三项评价指标的规则
+    pattern_report.json             分箱、阈值、算法比较与典型规则
     report.json                   统计、字典、规则、来源与版本
     report.md                     自动生成的质量检查与发现报告
 ```
@@ -83,6 +90,8 @@ data/processed/<月份>/
 - 时间图只统计目标月有效上车时间；工作日定义为周一至周五，尚未区分法定节假日。
 - `zone_hour` 补齐可用区域和目标月每个本地小时。零表示未观测到保留记录，不证明区域没有出行或数据源完整。
 - 本版使用 TLC 本地墙上时间，未转换 UTC；夏令时回拨的重复小时会合并。后续跨月时序建模需先制定时区策略。
+- 关联规则使用默认清洗视图和固定分箱；支持度不低于 1%，最大项集长度为 3。
+- 关联规则只描述共同出现，不能证明因果关系或未来必然发生。
 
 ## 代码导航
 
@@ -92,9 +101,11 @@ data/processed/<月份>/
 | `urbanpulse/download.py` | 数据来源、不可变输入与校验 |
 | `urbanpulse/pipeline.py` | SQL 清洗、关联、质量标记、特征聚合 |
 | `urbanpulse/analytics.py` | 描述统计、筛选分母、时间归一化 |
+| `urbanpulse/patterns.py` | 带权 Apriori、FP-Growth、规则评价与事务产物 |
 | `app.py` | 交互式探索与证据展示 |
 | `tests/` | 用反例验证数据与界面行为 |
-| `docs/LESSON1.md` | 第一课实操练习和交付模板 |
+| `docs/LESSON1.md` | 第一课数据理解、清洗与统计练习 |
+| `docs/LESSON2.md` | 第二课事务表示、算法与规则评价练习 |
 
 ## 来源
 
@@ -103,4 +114,4 @@ data/processed/<月份>/
 - [DuckDB 文档](https://duckdb.org/docs/)
 - [Streamlit 应用测试](https://docs.streamlit.io/develop/api-reference/app-testing)
 
-完整学期规划见 [PRD.md](PRD.md)。这一版本的两张派生表是后续模式挖掘、分类、聚类和异常检测的共同入口。
+完整学期规划见 [PRD.md](PRD.md)。当前派生表和规则结果是后续分类、聚类和异常检测的共同入口。

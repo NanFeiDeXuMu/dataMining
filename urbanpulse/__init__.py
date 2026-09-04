@@ -1,3 +1,3 @@
-"""UrbanPulse v0.1: reproducible, local-first taxi data exploration."""
+"""UrbanPulse v0.2: reproducible data exploration and pattern mining."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

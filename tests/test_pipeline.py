@@ -67,6 +67,16 @@ def test_full_grid_and_count_conservation(dataset):
         assert not grid.duplicated(["zone_id", "hour_start"]).any()
 
 
+def test_pattern_counts_and_algorithms_are_recorded(dataset):
+    _, run = dataset
+    report = json.loads((run / "report.json").read_text(encoding="utf-8"))
+    patterns = report["patterns"]
+    assert patterns["transaction_count"] == report["clean"]["records"] == 11
+    assert patterns["items_per_transaction"] == 8
+    assert patterns["algorithms"]["identical"]
+    assert patterns["algorithms"]["apriori_itemsets"] == patterns["frequent_itemsets"]
+
+
 def test_calendar_normalization_and_daily_gaps(dataset):
     _, run = dataset
     with Explorer(run / "urbanpulse.duckdb", "2025-01") as ex:

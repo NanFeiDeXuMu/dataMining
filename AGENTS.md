@@ -23,6 +23,7 @@ UrbanPulse 是可复现、可解释的城市出行数据挖掘课程项目。所
 
 - `urbanpulse/pipeline.py`：数据合同、清洗、质量报告和产物构建
 - `urbanpulse/patterns.py`：事务表示、Apriori、FP-Growth 和关联规则
+- `urbanpulse/forecasting.py`：严格过去式特征、时间切分、基线、模型与评价
 - `urbanpulse/analytics.py`：面向页面的参数化 DuckDB 查询
 - `app.py`：交互展示和证据回溯
 - `tests/`：算法、管道和页面行为验收

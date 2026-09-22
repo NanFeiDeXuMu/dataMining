@@ -38,12 +38,23 @@ class Rule:
 
 @dataclass(frozen=True)
 class PatternConfig:
-    """Fixed mining policy recorded with every snapshot."""
+    """Snapshot policy: support/size bound mining; confidence/lift default the UI."""
 
     min_support: float = 0.01
     min_confidence: float = 0.35
     min_lift: float = 1.05
     max_itemset_size: int = 3
+
+
+@dataclass(frozen=True)
+class ForecastConfig:
+    """One-hour-ahead experiment policy recorded with every snapshot."""
+
+    horizon_hours: int = 1
+    lags: tuple[int, ...] = (1, 2, 3, 24, 48, 168)
+    rolling_windows: tuple[int, ...] = (3, 24, 168)
+    train_fraction: float = 0.60
+    random_state: int = 20250904
 
 
 RULES = (
@@ -64,6 +75,7 @@ RULES = (
 RULE_BY_KEY = {rule.key: rule for rule in RULES}
 DEFAULT_RULES = tuple(rule.key for rule in RULES if rule.default)
 PATTERN_CONFIG = PatternConfig()
+FORECAST_CONFIG = ForecastConfig()
 PATTERN_FIELDS = (
     "日期类型", "上车时段", "上车行政区", "下车行政区",
     "距离区间", "费用区间", "支付方式", "乘客数区间",

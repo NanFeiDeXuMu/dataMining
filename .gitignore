@@ -7,3 +7,9 @@ data/processed/
 reports/generated/
 .streamlit/secrets.toml
 *.log
+/tmp/
+
+# Local course references are not project deliverables.
+/L*-*.pdf
+/L*-*.pptx
+/Chap*-*.pdf

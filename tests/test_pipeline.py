@@ -75,6 +75,20 @@ def test_pattern_counts_and_algorithms_are_recorded(dataset):
     assert patterns["items_per_transaction"] == 8
     assert patterns["algorithms"]["identical"]
     assert patterns["algorithms"]["apriori_itemsets"] == patterns["frequent_itemsets"]
+    assert patterns["schema_version"] == 2
+    assert patterns["rule_coverage"]["complete_within_itemsets"]
+    assert patterns["rules"] > patterns["default_display_rules"]
+    assert report["versions"]["urbanpulse"] == "0.3.1"
+
+
+def test_forecast_experiment_is_recorded(dataset):
+    _, run = dataset
+    report = json.loads((run / "report.json").read_text(encoding="utf-8"))
+    forecast = report["forecast"]
+    assert forecast["status"] == "complete"
+    assert forecast["target"].startswith("每个上车区域")
+    assert forecast["split_rows"]["train"] > forecast["split_rows"]["validation"]
+    assert len(forecast["leakage_policy"]) == 4
 
 
 def test_calendar_normalization_and_daily_gaps(dataset):
@@ -142,6 +156,9 @@ def test_rebuild_stable_and_previous_run_preserved(raw_dataset):
     two = json.loads((second / "report.json").read_text(encoding="utf-8"))
     for key in ("raw", "clean", "zone_hour_rows", "quality", "schema", "insights"):
         assert one[key] == two[key]
+    for key in ("target", "config", "feature_columns", "splits", "split_rows", "metrics",
+                "test_wape_improvement_vs_lag_168", "diagnostics", "leakage_policy"):
+        assert one["forecast"][key] == two["forecast"][key]
     with duckdb.connect() as con:
         assert con.read_parquet(str(first / "cleaned_trips.parquet")).df().equals(con.read_parquet(str(second / "cleaned_trips.parquet")).df())
     assert active_run(raw_dataset, "2025-01") == second

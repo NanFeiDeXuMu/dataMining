@@ -3,7 +3,8 @@
 from collections import Counter, defaultdict
 from dataclasses import asdict
 from itertools import combinations
-from math import ceil
+from math import ceil, sqrt
+from numbers import Integral
 from pathlib import Path
 from time import perf_counter
 
@@ -133,14 +134,81 @@ def frequent_frame(itemsets, total):
     return pd.DataFrame(rows, columns=columns)
 
 
-def association_rules(itemsets, total, min_confidence=0.35, min_lift=1.05):
-    if not 0 <= min_confidence <= 1 or min_lift < 0:
-        raise ValueError("置信度必须在 [0, 1]，提升度不能为负。")
+RULE_COUNTS = ["transaction_count", "support_count", "antecedent_count", "consequent_count",
+               "n11", "n10", "n01", "n00"]
+RULE_METRICS = ["support", "antecedent_support", "consequent_support", "confidence",
+                "reverse_confidence", "lift", "kulc", "imbalance_ratio", "jaccard", "cosine"]
+
+
+def rule_metrics(total, antecedent_count, consequent_count, support_count):
+    """Evaluate one disjoint A/B rule from exact counts; undefined ratios stay null."""
+    counts = (total, antecedent_count, consequent_count, support_count)
+    if any(isinstance(n, bool) or not isinstance(n, Integral) or n < 0 for n in counts):
+        raise ValueError("规则计数必须是非负整数。")
+    total, a, b, ab = map(int, counts)
+    if not max(0, a + b - total) <= ab <= min(a, b) or max(a, b) > total:
+        raise ValueError("规则计数不能形成有效的列联表。")
+    notes = []
+
+    def ratio(numerator, denominator, label):
+        if denominator == 0:
+            notes.append(f"{label}不可计算：分母为零")
+            return None
+        return numerator / denominator
+
+    confidence = ratio(ab, a, "A→B 置信度")
+    reverse = ratio(ab, b, "B→A 置信度")
+    kulc = (confidence + reverse) / 2 if confidence is not None and reverse is not None else None
+    if kulc is None:
+        notes.append("Kulc 不可计算：至少一个方向的置信度不可计算")
+    result = {
+        "transaction_count": total, "support_count": ab,
+        "antecedent_count": a, "consequent_count": b,
+        "n11": ab, "n10": a - ab, "n01": b - ab, "n00": total - a - b + ab,
+        "support": ratio(ab, total, "支持度"),
+        "antecedent_support": ratio(a, total, "A 基准比例"),
+        "consequent_support": ratio(b, total, "B 基准比例"),
+        "confidence": confidence, "reverse_confidence": reverse,
+        "lift": ratio(total * ab, a * b, "提升度"), "kulc": kulc,
+        "imbalance_ratio": ratio(abs(a - b), a + b - ab, "IR"),
+        "jaccard": ratio(ab, a + b - ab, "Jaccard"),
+        "cosine": ratio(ab, sqrt(a * b), "cosine"),
+    }
+    return {**result, "metric_notes": "；".join(notes)}
+
+
+def evaluated_rule_frame(rows):
+    """Keep numeric Parquet/SQL types even when a snapshot contains no rules."""
     columns = ["antecedent", "consequent", "antecedent_size", "consequent_size",
-               "support_count", "antecedent_count", "consequent_count",
-               "support", "confidence", "lift"]
+               *RULE_COUNTS, *RULE_METRICS, "metric_notes"]
+    frame = pd.DataFrame(rows, columns=columns)
+    return frame.astype({**{c: "string" for c in ["antecedent", "consequent", "metric_notes"]},
+                         **{c: "int64" for c in ["antecedent_size", "consequent_size", *RULE_COUNTS]},
+                         **{c: "float64" for c in RULE_METRICS}})
+
+
+def rule_coverage(metadata):
+    """Old snapshots persisted only rules passing confidence/lift thresholds."""
+    cfg = metadata["config"]
+    return metadata.get("rule_coverage", {
+        "min_support": cfg["min_support"], "max_itemset_size": cfg["max_itemset_size"],
+        "min_confidence": cfg["min_confidence"], "min_lift": cfg["min_lift"],
+        "complete_within_itemsets": False,
+    })
+
+
+def fold_rule_pairs(rules):
+    """Keep the best matching direction per A/B partition, preserving input order."""
+    frame = rules.copy()
+    frame["pair"] = [tuple(sorted((a, b))) for a, b in zip(frame.antecedent, frame.consequent)]
+    frame["matched_directions"] = frame.groupby("pair")["antecedent"].transform("size")
+    return frame.drop_duplicates("pair").reset_index(drop=True)
+
+
+def association_rules(itemsets, total):
+    """Generate every direction covered by frequent itemsets; filter at query time."""
     if not total:
-        return pd.DataFrame(columns=columns)
+        return evaluated_rule_frame([])
     rows = []
     for itemset, joint_count in itemsets.items():
         if len(itemset) < 2:
@@ -152,20 +220,16 @@ def association_rules(itemsets, total, min_confidence=0.35, min_lift=1.05):
                 consequent = itemset - antecedent
                 left_count = itemsets[antecedent]
                 right_count = itemsets[consequent]
-                confidence = joint_count / left_count
-                lift = confidence / (right_count / total)
-                if confidence >= min_confidence and lift >= min_lift:
-                    rows.append({
-                        "antecedent": "；".join(sorted(antecedent)),
-                        "consequent": "；".join(sorted(consequent)),
-                        "antecedent_size": len(antecedent), "consequent_size": len(consequent),
-                        "support_count": int(joint_count), "antecedent_count": int(left_count),
-                        "consequent_count": int(right_count), "support": joint_count / total,
-                        "confidence": confidence, "lift": lift,
-                    })
+                metrics = rule_metrics(total, left_count, right_count, joint_count)
+                rows.append({
+                    "antecedent": "；".join(sorted(antecedent)),
+                    "consequent": "；".join(sorted(consequent)),
+                    "antecedent_size": len(antecedent), "consequent_size": len(consequent),
+                    **metrics,
+                })
     rows.sort(key=lambda row: (-row["lift"], -row["confidence"], -row["support"],
                                row["antecedent"], row["consequent"]))
-    return pd.DataFrame(rows, columns=columns)
+    return evaluated_rule_frame(rows)
 
 
 def build_pattern_assets(con, run: Path, source_columns, config: PatternConfig = PATTERN_CONFIG):
@@ -225,7 +289,12 @@ def build_pattern_assets(con, run: Path, source_columns, config: PatternConfig =
         raise AssertionError("Apriori 与 FP-Growth 的频繁项集不一致。")
 
     frequent = frequent_frame(apriori_sets, transaction_count)
-    rules = association_rules(apriori_sets, transaction_count, config.min_confidence, config.min_lift)
+    # Mining coverage is independent of the default UI confidence/lift filters.
+    rules = association_rules(apriori_sets, transaction_count)
+    default_rules = rules[(rules.confidence >= config.min_confidence) & (rules.lift >= config.min_lift)]
+    expected_rules = sum(2 ** len(items) - 2 for items in apriori_sets if len(items) >= 2)
+    if len(rules) != expected_rules or rules.duplicated(["antecedent", "consequent"]).any():
+        raise AssertionError("已挖掘项集的方向规则不完整或重复。")
     con.register("_frequent_frame", frequent)
     con.register("_rule_frame", rules)
     con.execute("CREATE TABLE frequent_itemsets AS SELECT * FROM _frequent_frame")
@@ -237,18 +306,33 @@ def build_pattern_assets(con, run: Path, source_columns, config: PatternConfig =
     con.execute(f"COPY association_rules TO '{str(run / 'association_rules.parquet').replace("'", "''")}' (FORMAT PARQUET, COMPRESSION ZSTD)")
 
     return {
+        "schema_version": 2,
         "transaction_count": int(transaction_count), "unique_baskets": len(baskets),
         "items_per_transaction": len(PATTERN_FIELDS), "fields": list(PATTERN_FIELDS),
         "config": asdict(config), "frequent_itemsets": len(frequent), "rules": len(rules),
+        "default_display_rules": len(default_rules),
+        "rule_coverage": {
+            "min_support": config.min_support, "max_itemset_size": config.max_itemset_size,
+            "min_confidence": 0.0, "min_lift": 0.0, "complete_within_itemsets": True,
+        },
+        "metric_policy": {
+            "denominator": "全月默认清洗后的行程事务数；规则筛选不改变分母。",
+            "null_transactions": "相对于 A、B 均不出现的事务；不等于缺失记录。",
+            "undefined": "分母为零时指标为空，并记录不可计算原因。",
+            "kulc": "(nAB/nA + nAB/nB)/2",
+            "imbalance_ratio": "abs(nA-nB)/(nA+nB-nAB)",
+        },
         "algorithms": {
             "apriori_itemsets": len(apriori_sets), "fpgrowth_itemsets": len(fp_sets),
             "identical": True, "apriori_seconds": round(apriori_seconds, 6),
             "fpgrowth_seconds": round(fp_seconds, 6),
         },
-        "top_rules": rules.head(10).to_dict(orient="records"),
+        "top_rules": default_rules.head(10).to_dict(orient="records"),
         "limitations": [
             "规则描述共同出现关系，不证明因果关系或未来必然发生。",
             "模式基于默认清洗策略和固定分箱；改变口径可能改变结果。",
             "最低支持度以下的项集未保存，页面不能恢复未挖掘的低频规则。",
+            "已保存项集的全部方向规则可筛选；低于联合支持度门槛的负模式不在覆盖范围内。",
+            "Kulc 衡量双向重合，IR 描述边际不平衡；它们不证明因果或统计显著性。",
         ],
     }

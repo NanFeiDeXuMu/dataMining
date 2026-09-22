@@ -1,3 +1,3 @@
-"""UrbanPulse v0.2: reproducible data exploration and pattern mining."""
+"""UrbanPulse: reproducible rule evaluation, evidence and forecasting."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.1"

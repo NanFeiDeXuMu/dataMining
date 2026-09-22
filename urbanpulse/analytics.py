@@ -3,11 +3,13 @@
 from datetime import date, timedelta
 from pathlib import Path
 import json
+from math import isfinite
 
 import duckdb
 import pandas as pd
 
-from .config import PATTERN_CONFIG, RULES, keep_expression, month_bounds
+from .config import RULES, keep_expression, month_bounds
+from .patterns import evaluated_rule_frame, rule_coverage, rule_metrics
 
 
 def active_run(root: Path, month: str) -> Path:
@@ -26,6 +28,7 @@ def available_months(root: Path) -> list[str]:
 
 class Explorer:
     def __init__(self, db: Path, month: str):
+        self.run = Path(db).parent
         self.con = duckdb.connect(str(db), read_only=True)
         self.month = month
         self.start, self.end = month_bounds(month)
@@ -162,33 +165,83 @@ class Explorer:
             ORDER BY record_id LIMIT ?
         """, values + [int(limit)])
 
+    def pattern_metadata(self):
+        path = self.run / "pattern_report.json"
+        if not path.is_file():
+            raise ValueError("当前快照缺少模式元数据，请重新构建。")
+        return json.loads(path.read_text(encoding="utf-8"))
+
     def pattern_rules(self, min_support=None, min_confidence=None, min_lift=None,
-                      required_items=(), limit=200):
-        min_support = PATTERN_CONFIG.min_support if min_support is None else float(min_support)
-        min_confidence = PATTERN_CONFIG.min_confidence if min_confidence is None else float(min_confidence)
-        min_lift = PATTERN_CONFIG.min_lift if min_lift is None else float(min_lift)
-        limit = int(limit)
-        if not PATTERN_CONFIG.min_support <= min_support <= 1:
-            raise ValueError(f"支持度不能低于快照挖掘阈值 {PATTERN_CONFIG.min_support:.2%}。")
+                      required_items=(), sort_by="lift"):
+        """Return every matching direction; the page owns folding and pagination."""
+        metadata = self.pattern_metadata()
+        cfg, coverage = metadata["config"], rule_coverage(metadata)
+        min_support = cfg["min_support"] if min_support is None else float(min_support)
+        min_confidence = cfg["min_confidence"] if min_confidence is None else float(min_confidence)
+        min_lift = cfg["min_lift"] if min_lift is None else float(min_lift)
+        if not coverage["min_support"] <= min_support <= 1:
+            raise ValueError(f"支持度不能低于快照挖掘阈值 {coverage['min_support']:.2%}。")
         required_items = tuple(item for item in required_items if item)
-        if (not 0 <= min_confidence <= 1 or min_lift < 0 or not 1 <= limit <= 1000
-                or len(required_items) > 8):
+        if (not 0 <= min_confidence <= 1 or not isfinite(min_lift) or min_lift < 0
+                or len(required_items) > metadata["items_per_transaction"]
+                or sort_by not in {"support", "lift", "kulc"}):
             raise ValueError("关联规则筛选参数无效。")
+        if min_confidence < coverage["min_confidence"] or min_lift < coverage["min_lift"]:
+            raise ValueError("旧快照已预过滤规则，不能降低到保存阈值以下；请重新构建。")
         required = "".join(
             " AND list_contains(str_split(concat_ws('；', antecedent, consequent), '；'), ?)"
             for _ in required_items)
-        return self.query(f"""
-            SELECT antecedent, consequent, support_count, support, confidence, lift
+        stored = self.query(f"""
+            SELECT antecedent, consequent, antecedent_size, consequent_size,
+                support_count, antecedent_count, consequent_count
             FROM association_rules
             WHERE support >= ? AND confidence >= ? AND lift >= ? {required}
-            ORDER BY lift DESC, confidence DESC, support DESC, antecedent, consequent
-            LIMIT ?
-        """, [min_support, min_confidence, min_lift, *required_items, limit])
+        """, [min_support, min_confidence, min_lift, *required_items])
+        # Reuse the same count-based definitions for old and new snapshot schemas.
+        rows = [{**row, **rule_metrics(metadata["transaction_count"], row["antecedent_count"],
+                                     row["consequent_count"], row["support_count"])}
+                for row in stored.to_dict(orient="records")]
+        frame = evaluated_rule_frame(rows)
+        order = list(dict.fromkeys([sort_by, "confidence", "support", "antecedent", "consequent"]))
+        frame = frame.sort_values(order, ascending=[c in {"antecedent", "consequent"} for c in order])
+        return frame.reset_index(drop=True)
+
+    def _pattern_items(self, antecedent, consequent):
+        left, right = (side.split("；") for side in (antecedent, consequent))
+        items = left + right
+        max_size = self.pattern_metadata()["config"]["max_itemset_size"]
+        if not all(items) or len(set(items)) != len(items) or len(items) > max_size:
+            raise ValueError("规则前后件须非空、互不重叠，且不能超过快照最大项集长度。")
+        return left, right
+
+    def pattern_evidence(self, antecedent, consequent):
+        """Independently recount all four cells from the full trip transaction table."""
+        left, right = self._pattern_items(antecedent, consequent)
+        counts = self.query("""
+            WITH membership AS (
+                SELECT list_has_all(items, ?) AS has_a, list_has_all(items, ?) AS has_b
+                FROM trip_transactions
+            )
+            SELECT count(*) AS total, count(*) FILTER (WHERE has_a) AS a,
+                count(*) FILTER (WHERE has_b) AS b, count(*) FILTER (WHERE has_a AND has_b) AS ab
+            FROM membership
+        """, [left, right]).iloc[0]
+        result = rule_metrics(int(counts.total), int(counts.a), int(counts.b), int(counts.ab))
+        if result["transaction_count"] != self.pattern_metadata()["transaction_count"]:
+            raise ValueError("事务证据总数与快照元数据不一致。")
+        stored = self.query("""
+            SELECT support_count, antecedent_count, consequent_count FROM association_rules
+            WHERE antecedent = ? AND consequent = ?
+        """, [antecedent, consequent])
+        if not stored.empty and any(int(stored.iloc[0][key]) != result[key] for key in stored.columns):
+            raise ValueError("保存的规则计数与事务证据不一致，拒绝展示未经核对的指标。")
+        return result
 
     def pattern_sample(self, antecedent: str, consequent: str, limit=100):
-        items = [item for side in (antecedent, consequent) for item in side.split("；") if item]
+        left, right = self._pattern_items(antecedent, consequent)
+        items = left + right
         limit = int(limit)
-        if not items or len(items) > PATTERN_CONFIG.max_itemset_size or not 1 <= limit <= 100:
+        if not 1 <= limit <= 100:
             raise ValueError("关联规则示例参数无效。")
         conditions = " AND ".join("list_contains(t.items, ?)" for _ in items)
         return self.query(f"""
@@ -198,6 +251,56 @@ class Explorer:
             WHERE {conditions}
             ORDER BY a.record_id LIMIT ?
         """, items + [limit])
+
+    @staticmethod
+    def forecast_scope(split="test", zone=None):
+        if split not in {"validation", "test"}:
+            raise ValueError("预测分区必须是 validation 或 test。")
+        terms, values = ["split = ?"], [split]
+        if zone is not None:
+            terms.append("zone_id = ?")
+            values.append(int(zone))
+        return " AND ".join(terms), values
+
+    def forecast_metrics(self, split="test", zone=None) -> pd.DataFrame:
+        scope, values = self.forecast_scope(split, zone)
+        queries = []
+        parameters = []
+        for model, column in (("lag_24", "lag_24_prediction"),
+                              ("lag_168", "lag_168_prediction"),
+                              ("hist_gradient_boosting_poisson", "model_prediction")):
+            queries.append(f"""
+                SELECT '{model}' AS model, count(*) AS rows, sum(target) AS actual_sum,
+                    avg(abs(target - {column})) AS mae,
+                    CASE WHEN sum(target) > 0 THEN sum(abs(target - {column})) / sum(target) END AS wape,
+                    sqrt(avg(pow(target - {column}, 2))) AS rmse
+                FROM forecast_predictions WHERE {scope}
+            """)
+            parameters.extend(values)
+        return self.query(" UNION ALL ".join(queries), parameters)
+
+    def forecast_series(self, split="test", zone=None) -> pd.DataFrame:
+        scope, values = self.forecast_scope(split, zone)
+        return self.query(f"""
+            SELECT target_hour, sum(target) AS actual,
+                sum(lag_168_prediction) AS lag_168_prediction,
+                sum(model_prediction) AS model_prediction
+            FROM forecast_predictions WHERE {scope}
+            GROUP BY target_hour ORDER BY target_hour
+        """, values)
+
+    def forecast_errors(self, split="test", zone=None, limit=100) -> pd.DataFrame:
+        scope, values = self.forecast_scope(split, zone)
+        limit = int(limit)
+        if not 1 <= limit <= 500:
+            raise ValueError("预测误差示例数量必须在 1 到 500 之间。")
+        return self.query(f"""
+            SELECT target_hour, zone_id, zone, borough, target AS actual,
+                model_prediction, lag_168_prediction,
+                abs(target - model_prediction) AS absolute_error
+            FROM forecast_predictions WHERE {scope}
+            ORDER BY absolute_error DESC, target_hour, zone_id LIMIT ?
+        """, values + [limit])
 
 
 def insights(raw: dict, clean: dict, hourly: pd.DataFrame, month: str) -> list[str]:

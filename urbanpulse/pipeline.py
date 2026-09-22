@@ -12,9 +12,11 @@ import secrets
 
 import duckdb
 
+from . import __version__
 from .analytics import Explorer, insights
 from .config import DEFAULT_RULES, FIELD_INFO, REQUIRED_COLUMNS, RULES, keep_expression, month_bounds
 from .download import sha256, write_json
+from .forecasting import build_forecast_assets
 from .patterns import build_pattern_assets
 
 
@@ -165,7 +167,9 @@ def build(month: str, root: Path) -> Path:
         grid_n, trip_sum = con.execute("SELECT count(*), coalesce(sum(trip_count), 0) FROM zone_hour").fetchone()
         if trip_sum != clean_n:
             raise AssertionError("区域-小时汇总与清洗后总数不守恒。")
-        print("区域-小时特征完成；正在挖掘 Apriori 与 FP-Growth 频繁模式。", flush=True)
+        print("区域-小时特征完成；正在训练下一小时预测模型。", flush=True)
+        forecast_report = build_forecast_assets(con, run, month)
+        print("预测产物完成；正在挖掘 Apriori 与 FP-Growth 频繁模式。", flush=True)
         pattern_report = build_pattern_assets(con, run, names)
         if pattern_report["transaction_count"] != clean_n:
             raise AssertionError("行程事务数与清洗后总数不守恒。")
@@ -182,9 +186,11 @@ def build(month: str, root: Path) -> Path:
         "month": month, "built_at_utc": datetime.now(timezone.utc).isoformat(),
         "source": manifest, "policy": list(DEFAULT_RULES),
         "rules": [{"key": r.key, "label": r.label, "reason": r.reason, "default": r.default} for r in RULES],
-        "raw": raw, "clean": clean, "zone_hour_rows": grid_n, "patterns": pattern_report,
+        "raw": raw, "clean": clean, "zone_hour_rows": grid_n,
+        "forecast": forecast_report, "patterns": pattern_report,
         "quality": quality.to_dict(orient="records"), "schema": profile, "insights": observations,
-        "versions": {package: version(package) for package in ("duckdb", "pandas", "pyarrow")},
+        "versions": {"urbanpulse": __version__, **{package: version(package) for package in
+                     ("duckdb", "pandas", "pyarrow", "scikit-learn")}},
         "limitations": [
             "数据为 TLC 已记录行程，不代表全部真实需求或未满足需求。",
             "可疑不等于错误或欺诈；负费用和极端值默认保留，重复外观记录不自动去重。",
@@ -194,10 +200,17 @@ def build(month: str, root: Path) -> Path:
             "不含现金小费，不能据此比较不同支付方式的全部小费。",
             "全文件保留率和筛选窗口保留率可能不同，问题规则之间允许重叠。",
             "关联规则描述共同出现，不证明因果关系；结果依赖默认清洗与固定分箱。",
+            "预测目标是已记录的下一小时上车行程数，不等于未满足需求；当前单月评价只用于开发验证。",
         ],
     }
     write_json(run / "report.json", metadata)
     write_json(run / "pattern_report.json", pattern_report)
+    forecast_improvement = forecast_report["test_wape_improvement_vs_lag_168"]
+    forecast_improvement_line = (
+        f"- 测试集相对 lag-168 的 WAPE 改善：{forecast_improvement:.2%}。"
+        if forecast_improvement is not None else
+        "- 测试集实际行程总数为零，WAPE 及相对改善不可计算。"
+    )
     report = [f"# UrbanPulse 数据体检报告 | {month}", "", "## 三条可复核观察", ""]
     report.extend(f"- {line}" for line in observations)
     report.extend(["", "## 质量检查（规则重叠，不可相加）", "", "| 检查项 | 记录数 | 占全文件比例 | 默认排除 |", "|---|---:|---:|---|"])
@@ -206,12 +219,20 @@ def build(month: str, root: Path) -> Path:
     report.extend(["", "## 解释边界", ""] + [f"- {x}" for x in metadata["limitations"]])
     report.extend(["", "## 关联规则", "",
                    f"- 事务：{pattern_report['transaction_count']:,}；聚合篮子：{pattern_report['unique_baskets']:,}",
-                   f"- 频繁项集：{pattern_report['frequent_itemsets']:,}；规则：{pattern_report['rules']:,}",
+                   f"- 频繁项集：{pattern_report['frequent_itemsets']:,}；完整方向规则：{pattern_report['rules']:,}；默认展示阈值匹配：{pattern_report['default_display_rules']:,}",
+                   "- 保存已挖掘项集的全部方向规则；支持度与最大长度限定覆盖范围，置信度/lift 为展示筛选。",
+                   "- 规则附带 N、前后件计数、四格列联表、双向置信度、Kulc 和 IR；页面从事务表独立复算证据。",
                    "- Apriori 与 FP-Growth 已验证得到完全相同的频繁项集；关联不代表因果。",
+                   "", "## 下一小时预测", "",
+                   f"- 严格时间切分：训练 {forecast_report['split_rows']['train']:,}；验证 {forecast_report['split_rows']['validation']:,}；测试 {forecast_report['split_rows']['test']:,} 个区域小时。",
+                   f"- 模型：{forecast_report['model']['name']}（Poisson 损失）；与 lag-24、lag-168 在相同测试行上比较。",
+                   forecast_improvement_line,
+                   "- 任何滚动或滞后特征都止于目标小时前一小时；单月结果不代表长期泛化。",
                    "", "## 可复现信息", "", f"- 默认清洗规则：`{', '.join(DEFAULT_RULES)}`", f"- 区域-小时特征行数：{grid_n:,}", "- 原始文件未修改；全部原始字段、稳定记录号和检查标记存于数据库 annotated 表。"])
     for entry in manifest["files"]:
         report.append(f"- {entry['file']}：SHA-256 `{entry['sha256']}`；来源 {entry.get('url', '本地测试夹具')}")
     (run / "report.md").write_text("\n".join(report) + "\n", encoding="utf-8")
     write_json(base / "active.json", {"run": run.name})
-    print(f"构建完成：原始 {count:,}；默认规则保留 {clean_n:,}；特征 {grid_n:,} 行；关联规则 {pattern_report['rules']:,} 条。\n输出：{run}", flush=True)
+    print(f"构建完成：原始 {count:,}；默认规则保留 {clean_n:,}；特征 {grid_n:,} 行；"
+          f"预测测试 {forecast_report['split_rows']['test']:,} 行；关联规则 {pattern_report['rules']:,} 条。\n输出：{run}", flush=True)
     return run

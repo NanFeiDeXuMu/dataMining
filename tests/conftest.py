@@ -1,7 +1,10 @@
 """Small synthetic edge cases for tests only; never substituted for real app data."""
 
 from pathlib import Path
+import json
+import shutil
 
+import duckdb
 import pandas as pd
 import pytest
 
@@ -17,6 +20,8 @@ def make_raw(root: Path):
             "PULocationID": 1.0, "DOLocationID": 2.0, "fare_amount": 15.0,
             "total_amount": 20.0, "passenger_count": 1.0, "payment_type": 1}
     rows = [base.copy() for _ in range(22)]
+    rows[0].update(tpep_pickup_datetime=pd.Timestamp("2025-01-10 12:00"),
+                   tpep_dropoff_datetime=pd.Timestamp("2025-01-10 12:10"))
     rows[2].update(total_amount=-20.0, fare_amount=-15.0)
     rows[3]["passenger_count"] = None
     rows[4]["total_amount"] = 350.0
@@ -28,7 +33,8 @@ def make_raw(root: Path):
     rows[10]["total_amount"] = float("inf")
     rows[11]["PULocationID"] = 265
     rows[12]["DOLocationID"] = 999
-    rows[13].update(tpep_pickup_datetime=pd.Timestamp("2025-01-04 12:00"), tpep_dropoff_datetime=pd.Timestamp("2025-01-04 12:10"))
+    rows[13].update(tpep_pickup_datetime=pd.Timestamp("2025-01-22 12:00"),
+                    tpep_dropoff_datetime=pd.Timestamp("2025-01-22 12:10"))
     rows[14]["tpep_dropoff_datetime"] = pd.Timestamp("2025-01-01 17:00")
     rows[15]["tpep_dropoff_datetime"] = pd.Timestamp("2025-01-01 12:00:06")
     rows[16]["trip_distance"] = None
@@ -57,3 +63,29 @@ def dataset(tmp_path_factory):
 @pytest.fixture
 def raw_dataset(tmp_path):
     return make_raw(tmp_path)
+
+
+@pytest.fixture
+def legacy_dataset(dataset, tmp_path):
+    """An isolated v1-shaped snapshot, including its real prefiltering behavior."""
+    root = tmp_path / "legacy"
+    run = root / "processed" / "2025-01" / "run-legacy"
+    shutil.copytree(dataset[1], run)
+    metadata = json.loads((run / "pattern_report.json").read_text(encoding="utf-8"))
+    cfg = metadata["config"]
+    with duckdb.connect(str(run / "urbanpulse.duckdb")) as con:
+        con.execute("""
+            CREATE OR REPLACE TABLE association_rules AS
+            SELECT antecedent, consequent, antecedent_size, consequent_size,
+                support_count, antecedent_count, consequent_count, support, confidence, lift
+            FROM association_rules WHERE confidence >= ? AND lift >= ?
+        """, [cfg["min_confidence"], cfg["min_lift"]])
+        metadata["rules"] = con.execute("SELECT count(*) FROM association_rules").fetchone()[0]
+    for key in ("schema_version", "rule_coverage", "metric_policy", "default_display_rules"):
+        metadata.pop(key, None)
+    write_json(run / "pattern_report.json", metadata)
+    report = json.loads((run / "report.json").read_text(encoding="utf-8"))
+    report["patterns"] = metadata
+    write_json(run / "report.json", report)
+    write_json(run.parent / "active.json", {"run": run.name})
+    return root, run

@@ -4,11 +4,12 @@ import argparse
 from pathlib import Path
 import sys
 
+from . import __version__
 from .config import data_root, month_bounds
 
 
 def main():
-    parser = argparse.ArgumentParser(description="UrbanPulse v0.2 数据管道")
+    parser = argparse.ArgumentParser(description=f"UrbanPulse v{__version__} 数据管道")
     parser.add_argument("command", choices=["download", "build", "prepare"])
     parser.add_argument("--month", default="2025-01", help="固定月份 YYYY-MM")
     parser.add_argument("--data-dir", type=Path, default=data_root())

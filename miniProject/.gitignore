@@ -1,0 +1,11 @@
+/.venv/
+/gesture_9000/
+/models/
+/*.task
+/*.pdf
+/data/
+/reports/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.log

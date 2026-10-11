@@ -1,0 +1,45 @@
+Spatiotemporal Association Patterns in NYC Taxi Trips: Discovery, Stability, and Local Patterns Missed by Global Mining
+
+Group 24: Yixuan Liu, Zhike Tang, Zizhou Huang
+
+
+1. Background and Objectives
+
+Urban travel is driven by recurring activities such as commuting, business, leisure, and airport trips, which give it strong regularity in both time and space. Association rule mining can uncover co-occurring patterns in large-scale trip records, yet common practice leaves two gaps. First, patterns are usually mined once within a single time window, and their reproducibility in later periods is rarely tested. Second, a single citywide support threshold filters out links that matter for a particular zone at a particular time but account for a small share of citywide trips, a problem we call local pattern omission.
+
+This project uses New York City taxi trip data to identify recurring, interpretable travel associations between zones across temporal contexts, and tests whether these associations persist in subsequent months. Building on this, it compares global mining with stratified local mining to determine which locally important links the citywide high-frequency patterns miss. The outcome is a travel pattern atlas annotated with applicable zones, temporal contexts, and stability evidence, supporting time- and zone-specific operational analysis.
+
+
+2. Data
+
+The study uses yellow taxi trip records published by the NYC Taxi & Limousine Commission (TLC), about three million trips per month. Each trip is encoded as a transaction whose items include pickup and drop-off zones (OD), day type, time slot, and attributes such as distance and fare; zones carry a two-level hierarchy of taxi zone and borough. Consecutive months are split chronologically into non-overlapping discovery and validation periods.
+
+
+3. Research Questions
+
+RQ1 (core): Which zone-to-zone travel links recur across temporal contexts? Output: spatiotemporal association rules and typical OD links.
+
+RQ2 (core): Do the discovered links still hold in later months? Output: stability assessment, with persistent and decaying cases.
+
+RQ3 (extension): Which locally important, recurring links does global mining miss? Output: global-local comparison and cases of missed patterns.
+
+
+4. Methods
+
+Spatiotemporal pattern discovery (RQ1). Identical transactions are merged into weighted transactions, and frequent itemsets are mined with FP-Growth. Beyond support, confidence, and lift, rules are evaluated with null-invariant measures, namely the Kulczynski coefficient and the imbalance ratio (IR), so that results remain comparable across periods and sample sizes. Relations produced directly by field definitions, zone mappings, or fare rules are flagged as mechanistic and reported separately.
+
+Stability testing (RQ2). Candidate rules, binning, and thresholds are set in the discovery period and then frozen. In the validation period, the same candidates are recounted directly rather than re-mined month by month. Stability is measured by forward retention rate and metric drift, with confidence intervals from a weekly block bootstrap, distinguishing persistent, context-specific, and decaying patterns.
+
+Global-local comparison (RQ3). Drawing on multi-level and constraint-based association mining, transactions are stratified by borough and time slot and mined within each stratum using local support. Comparing local and global results surfaces patterns that are prominent locally but fall below the global threshold; the growth rate from emerging pattern mining quantifies their local specificity. Minimum counts, false discovery rate (FDR) control, and a reproducibility check in the validation period keep the identified local patterns reliable.
+
+
+5. Expected Contributions
+
+The practical value lies in two areas. First, as an operational reference, the project identifies zone links that are consistently prominent in specific time slots, informing shift scheduling and standby planning. Second, as a source of local insight, it reveals links that are minor citywide but meaningful for a particular zone and time slot.
+
+Methodologically, the project extends pattern mining from one-off discovery to a complete discover-validate-localize workflow, establishing the reproducibility of results and exposing how global thresholds dilute local patterns.
+
+
+6. Future Extensions
+
+Building on the three core questions, the project can extend in several directions. Finer strata: travel communities detected on the OD network (for example, with the Leiden algorithm) can replace boroughs as units of local analysis. Global structure: non-negative tensor factorization of the zone x zone x time tensor can summarize citywide travel rhythms and cross-validate the association rules. Temporal order: sequential pattern mining (for example, PrefixSpan) can trace the evolution of zone-level travel states. Broader data: more months, holiday and weather data can be added, and patterns can be compared before and after Manhattan's congestion pricing took effect in early 2025.
